@@ -1,0 +1,54 @@
+﻿# 网络收音机电台列表（2026-08 已验证可用）
+# 编码：UTF-8 with BOM
+# 格式：每行 "显示名=URL"，# 开头是注释，空行忽略
+# 说明：支持 MP3 / AAC 直连流和 m3u8 (HLS) 直播
+
+# ═══ 央广卫星源 (m3u8) ═══
+中国之声(卫星)=http://satellitepull.cnr.cn/live/wxzgzs/playlist.m3u8
+经济之声(卫星)=http://satellitepull.cnr.cn/live/wxjjzs/playlist.m3u8
+音乐之声(卫星)=http://satellitepull.cnr.cn/live/wxyyzs/playlist.m3u8
+文艺之声(卫星)=http://satellitepull.cnr.cn/live/wxwyzs/playlist.m3u8
+老年之声(卫星)=http://satellitepull.cnr.cn/live/wxlnzs/playlist.m3u8
+民族之声(卫星)=http://satellitepull.cnr.cn/live/wxmzzs/playlist.m3u8
+HitFM 劲曲调频(卫星)=http://satellitepull.cnr.cn/live/wxhitfm/playlist.m3u8
+
+# ═══ CRI 国际台 (m3u8) ═══
+环球资讯=http://sk.cri.cn/905.m3u8
+南海之声=http://sk.cri.cn/nhzs.m3u8
+中文环球=http://sk.cri.cn/hyhq.m3u8
+海峡飞虹=http://sk.cri.cn/hxfh.m3u8
+
+# ═══ 地方台 (mp3 直连) ═══
+上海新闻广播=https://lhttp.qtfm.cn/live/270/64k.mp3
+上海动感101=https://lhttp.qtfm.cn/live/274/64k.mp3
+北京交通广播=https://lhttp.qtfm.cn/live/336/64k.mp3
+江苏交通广播=https://lhttp-hw.qtfm.cn/live/4054/64k.mp3
+四川综合广播=https://lhttp.qtfm.cn/live/20207767/64k.mp3
+四川交通广播=https://lhttp.qtfm.cn/live/20207769/64k.mp3
+陕西新闻广播=https://lhttp.qtfm.cn/live/1600/64k.mp3
+陕西交通广播=https://lhttp.qtfm.cn/live/1602/64k.mp3
+陕西音乐广播=https://lhttp.qtfm.cn/live/1603/64k.mp3
+海南新闻广播=https://lhttp.qtfm.cn/live/1861/64k.mp3
+浙江新闻广播=https://lhttp.qtfm.cn/live/1121/64k.mp3
+山东新闻广播=https://lhttp.qtfm.cn/live/1110/64k.mp3
+山东生活广播=https://lhttp.qtfm.cn/live/1115/64k.mp3
+黑龙江新闻广播=https://lhttp.qtfm.cn/live/1140/64k.mp3
+黑龙江音乐广播=https://lhttp.qtfm.cn/live/1143/64k.mp3
+云南新闻广播=https://lhttp.qtfm.cn/live/1160/64k.mp3
+云南交通广播=https://lhttp.qtfm.cn/live/1161/64k.mp3
+云南音乐广播=https://lhttp.qtfm.cn/live/1163/64k.mp3
+
+# ═══ 香港 (mp3/aac 直连) ═══
+RTHK 第一台=http://stm1.rthk.hk/radio1
+RTHK 第二台=http://stm2.rthk.hk/radio2
+RTHK 第三台=http://stm3.rthk.hk/radio3
+数码之声 HK=http://ice.digitalradiohk.net:8000/drhk
+AXR 香港=http://hongkongstream.axr.online/
+
+# ═══ 台湾 (aac 直连) ═══
+ICRT 台北国际社区广播=https://n27a-eu.rcs.revma.com/nkdfurztxp3vv
+
+# ═══ 香港 AsiaFM (AAC+ 直连) ═══
+AsiaFM 亚洲音乐台=http://asiafm.hk:8000/asiafm
+AsiaFM 亚洲经典台=http://goldfm.cn:8000/goldfm
+AsiaFM 亚洲天空台=http://funradio.cn:8000/funradio

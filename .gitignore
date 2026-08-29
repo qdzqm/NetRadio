@@ -1,0 +1,5 @@
+# 构建中间产物 / build artifacts
+faad/obj/
+faad/libfaad.a
+*.o
+*.log
