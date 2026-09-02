@@ -7,9 +7,12 @@
 /* --- 一次性 HTTP GET（内部自管 WinInet 句柄） ---
  * 成功返回 1，*outBuf 需调用方 LocalFree；失败返回 0。
  * maxLen 为最大接收字节数（防内存爆炸）。
- * quit 为可选退出标志（非零时尽快中止，可为 NULL）。 */
+ * quit 为可选退出标志（非零时尽快中止，可为 NULL）。
+ * outReq 为可选的请求句柄登记槽（volatile HINTERNET*）：函数在发起请求前
+ * 把请求句柄写入 *outReq，返回前置 NULL。外部可通过 InternetCloseHandle 强制
+ * 中断阻塞中的连接/读取（切台时用），可为 NULL。 */
 int hlsHttpGet(const char* url, BYTE** outBuf, int* outLen, int maxLen,
-               volatile LONG* quit);
+               volatile LONG* quit, volatile HINTERNET* outReq);
 
 /* --- 相对 URL 解析 --- */
 void hlsResolveUrl(const char* baseUrl, const char* rel, char* out, int cap);

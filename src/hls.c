@@ -22,7 +22,7 @@ static void hlsSetTimeouts(HINTERNET hR) {
 
 /* ---------------- 一次性 HTTP GET ---------------- */
 int hlsHttpGet(const char* url, BYTE** outBuf, int* outLen, int maxLen,
-               volatile LONG* quit) {
+               volatile LONG* quit, volatile HINTERNET* outReq) {
 #define hlsQuit() (quit && *(quit) != 0)
     int ok = 0;
     HINTERNET hI = NULL, hC = NULL, hR = NULL;
@@ -61,6 +61,7 @@ int hlsHttpGet(const char* url, BYTE** outBuf, int* outLen, int maxLen,
     hR = HttpOpenRequestA(hC, "GET", full, "HTTP/1.1", NULL, NULL, flags, 0);
     if (!hR) goto done;
     hlsSetTimeouts(hR);
+    if (outReq) InterlockedExchangePointer((volatile PVOID*)outReq, (PVOID)hR);  /* 登记，供外部强制中断 */
     if (!HttpSendRequestA(hR, NULL, 0, NULL, 0)) goto done;
 
     char status[32]; DWORD szl = sizeof(status);
@@ -83,6 +84,7 @@ int hlsHttpGet(const char* url, BYTE** outBuf, int* outLen, int maxLen,
     *outBuf = buf; *outLen = len; buf = NULL;
     ok = (len > 0) && !hlsQuit();
 done:
+    if (outReq) InterlockedExchangePointer((volatile PVOID*)outReq, NULL);   /* 注销登记 */
     if (buf) LocalFree(buf);
     if (hR) InternetCloseHandle(hR);
     if (hC) InternetCloseHandle(hC);

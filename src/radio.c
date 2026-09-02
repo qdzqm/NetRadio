@@ -84,6 +84,27 @@ static RADIO_INFO         g_info;
 static HANDLE             g_netThread = NULL;   /* 网络线程（流式读取或 HLS 下载） */
 static volatile LONG      g_netErr  = 0;        /* 网络彻底失败 */
 static volatile LONG      g_netDone = 0;        /* 数据源正常结束 */
+
+/* 网络线程会话上下文：网络线程只通过这里的指针访问环形缓冲与 WinINet 句柄，
+ * 不直接碰全局 g_rb/g_rbEvt。切台时 worker 递增代际后，旧网络线程的 gen 与
+ * 全局代际不符，便立即停止写入并退出，绝不访问新会话资源，杜绝闪退。 */
+typedef struct {
+    BYTE*           rb;       /* 本会话环形缓冲 */
+    HANDLE          rbEvt;    /* 本会话事件 */
+    LONG            gen;      /* 本会话代际 */
+    HINTERNET       hInet;    /* 本会话 Internet 根句柄（网络线程关闭） */
+    HINTERNET       hConn;    /* 本会话连接句柄（网络线程关闭） */
+    HINTERNET       hReq;     /* 本会话流式请求句柄（可被外部强制关闭） */
+    volatile HINTERNET killReq; /* HLS 下载请求句柄登记槽，供外部强制中断 */
+} NetSess;
+
+/* 会话代际：每次 play/stop 递增。worker 与网络线程启动时捕获自己的代际，
+ * 只有“仍是当前代”的线程才允许读写全局共享资源。 */
+static volatile LONG      g_gen = 0;
+static volatile LONG      g_netGen = 0;   /* 当前网络会话代际（与 g_gen 同步） */
+/* 当前会话的网络线程上下文（worker 启动网络线程前设置、join 后置空），
+ * 用于强制中断时关闭 HLS/流式阻塞句柄。 */
+static NetSess*           g_killSess = NULL;
 static volatile LONG      g_bps     = 12000;    /* 估算码率（字节/秒） */
 static int                g_fmtKbps = 0;        /* AAC 已显示码率（kbps），估算值变化才刷新 */
 static char               g_urlA[1024];         /* 当前播放地址（重连用） */
@@ -224,7 +245,33 @@ static BOOL quitNow(void) { return InterlockedCompareExchange(&g_quit, 0, 0) != 
 static int  ringFill(void) { return (int)(g_rbW - g_rbR); }
 static void ringReset(void) { g_rbW = 0; g_rbR = 0; }
 
-/* 写入 n 字节，阻塞直到写完或退出；返回实际写入量 */
+/* 网络线程写环：会话失效（切台/退出）立即停止，避免写已释放内存。
+ * 返回写入字节数；-1 表示会话已失效，调用方应立刻结束线程。 */
+static int sessRingWrite(NetSess* s, const BYTE* p, int n) {
+    int off = 0;
+    while (off < n) {
+        if (quitNow() || s->gen != g_netGen || !s->rb) return off > 0 ? off : -1;
+        LONGLONG w = g_rbW;
+        int space = NET_BUF_CAP - (int)(w - g_rbR);
+        if (space <= 0) {
+            /* 缓冲满：直播丢旧数据贴近直播边缘，而不是无限等待 */
+            LONGLONG drop = NET_BUF_CAP / 4;
+            g_rbR = w - NET_BUF_CAP + drop;
+            WaitForSingleObject(s->rbEvt, 30);
+            continue;
+        }
+        int k = n - off; if (k > space) k = space;
+        int pos = (int)(w % NET_BUF_CAP);
+        int part = NET_BUF_CAP - pos; if (k > part) k = part;
+        memcpy(s->rb + pos, p + off, k);
+        g_rbW = w + k;
+        off += k;
+        SetEvent(s->rbEvt);
+    }
+    return off;
+}
+
+/* 写入 n 字节，阻塞直到写完或退出；返回实际写入量（解码线程用，本会话内安全） */
 static int ringWrite(const BYTE* p, int n) {
     int off = 0;
     while (off < n && !quitNow()) {
@@ -595,16 +642,6 @@ static BOOL httpOpenEx(HINTERNET* oInet, HINTERNET* oConn, HINTERNET* oReq,
     return TRUE;
 }
 
-static BOOL httpOpen(const char* urlA, IcyCtx* icy, char* ctOut, int ctCap) {
-    return httpOpenEx(&g_hInet, &g_hConn, &g_hReq, urlA, icy, ctOut, ctCap, 0, FALSE);
-}
-
-static void httpClose(void) {
-    if (g_hReq)  { InternetCloseHandle(g_hReq);  g_hReq  = NULL; }
-    if (g_hConn) { InternetCloseHandle(g_hConn); g_hConn = NULL; }
-    if (g_hInet) { InternetCloseHandle(g_hInet); g_hInet = NULL; }
-}
-
 static void icyParseMeta(IcyCtx* icy) {
     int nullPos = icy->metaLen;
     if (nullPos > (int)sizeof(icy->meta) - 1) nullPos = (int)sizeof(icy->meta) - 1;
@@ -662,9 +699,6 @@ static int icyReadEx(HINTERNET hReq, IcyCtx* icy, volatile LONG* quit,
     }
     return done;
 }
-static int icyRead(IcyCtx* icy, BYTE* dst, int want) {
-    return icyReadEx(g_hReq, icy, &g_quit, dst, want);
-}
 
 /* ---------------- 解码器生命周期 ---------------- */
 static void decodersReset(void) {
@@ -712,20 +746,22 @@ static void statusByState(void) {
 
 /* ---------------- 网络线程（流式） ----------------
  * 只管把压缩数据灌入环形缓冲；读错自动重连（指数退避，最多 3 次），
- * 期间解码线程靠存量缓冲继续播，网络抖动不会被耳朵听到。 */
-static IcyCtx g_netIcy;
-
+ * 期间解码线程靠存量缓冲继续播，网络抖动不会被耳朵听到。
+ * 句柄与会话状态由 NetSess 持有（堆分配，线程退出时自行释放），
+ * worker 强制中断时 InternetCloseHandle(s->hReq) 即可解除阻塞。 */
 static unsigned __stdcall netStreamThread(void* arg) {
-    (void)arg;
-    IcyCtx* icy = &g_netIcy;
-    BOOL open = (g_hReq != NULL);
+    NetSess* s = (NetSess*)arg;
+    IcyCtx icy; memset(&icy, 0, sizeof(icy));
+    HINTERNET hInet = s->hInet, hConn = s->hConn, hReq = s->hReq;
+    s->hInet = s->hConn = s->hReq = NULL;   /* 接管预连接句柄 */
+    BOOL open = (hReq != NULL);
     int retries = 0;
     BYTE tmp[8192];
-    while (!quitNow()) {
+    while (!quitNow() && s->gen == g_netGen) {
         if (!open) {
             char ct[128] = {0};
-            memset(icy, 0, sizeof(*icy));
-            if (!httpOpenEx(&g_hInet, &g_hConn, &g_hReq, g_urlA, icy,
+            memset(&icy, 0, sizeof(icy));
+            if (!httpOpenEx(&hInet, &hConn, &hReq, g_urlA, &icy,
                             ct, sizeof(ct), 8000, FALSE)) {
                 if (++retries > 3) { InterlockedExchange(&g_netErr, 1); break; }
                 setStatusW(L"连接中断，正在重连…");
@@ -735,16 +771,27 @@ static unsigned __stdcall netStreamThread(void* arg) {
             open = TRUE; retries = 0;
             statusByState();
         }
-        int got = icyReadEx(g_hReq, icy, &g_quit, tmp, sizeof(tmp));
-        if (got > 0) { ringWrite(tmp, got); continue; }
-        if (quitNow()) break;
+        int got = icyReadEx(hReq, &icy, &g_quit, tmp, sizeof(tmp));
+        if (got > 0) {
+            if (sessRingWrite(s, tmp, got) < 0) break;   /* 会话失效，立即结束 */
+            continue;
+        }
+        if (quitNow() || s->gen != g_netGen) break;
         if (got == 0) { InterlockedExchange(&g_netDone, 1); break; }
-        httpClose();   /* 读取错误：断开重连，环形缓冲继续供播 */
+        /* 读取错误：断开重连，环形缓冲继续供播 */
+        if (hReq) { InternetCloseHandle(hReq); hReq = NULL; }
+        if (hConn) { InternetCloseHandle(hConn); hConn = NULL; }
+        if (hInet) { InternetCloseHandle(hInet); hInet = NULL; }
         open = FALSE;
         if (++retries > 3) { InterlockedExchange(&g_netErr, 1); break; }
         setStatusW(L"网络中断，正在重连…");
         quitSleep(500 << (retries - 1));
     }
+    if (hReq)  InternetCloseHandle(hReq);
+    if (hConn) InternetCloseHandle(hConn);
+    if (hInet) InternetCloseHandle(hInet);
+    /* 不 free(s)：sess 归 worker 所有，由 worker 在 join 本线程后统一释放，
+     * 避免 worker 强制中断时访问到已被本线程 free 的 sess（悬垂指针竞态）。 */
     return 0;
 }
 
@@ -962,26 +1009,22 @@ done:
  * 持续领先播放端下载，天然实现分片预取，片间无缝；
  * 解码侧与流式共用 runDecode 的缓冲状态机。 */
 static unsigned __stdcall hlsThread(void* arg) {
-    Prewarm* take = (Prewarm*)arg;
+    /* 参数为 NetSess*（worker 创建）；take 预缓存通过全局 g_pwTake 传递不再适用，
+     * 这里统一由 worker 在启动前把预缓存数据灌入环形缓冲，线程只负责下载。 */
+    NetSess* s = (NetSess*)arg;
+    Prewarm* take = NULL;   /* HLS 预缓存接管由 worker 完成后传 NULL */
     char plUrl[1024];
     BYTE* plBuf = NULL; int plLen = 0;
 
-    if (take && take->plBuf) {
-        _snprintf(plUrl, sizeof(plUrl) - 1, "%s", take->plUrl);
-        plUrl[sizeof(plUrl) - 1] = 0;
-        plBuf = take->plBuf; plLen = take->plLen;
-        take->plBuf = NULL;
-    } else {
-        _snprintf(plUrl, sizeof(plUrl) - 1, "%s", g_urlA);
-        plUrl[sizeof(plUrl) - 1] = 0;
-    }
+    _snprintf(plUrl, sizeof(plUrl) - 1, "%s", g_urlA);
+    plUrl[sizeof(plUrl) - 1] = 0;
 
     /* 跟进主列表变体（最多 4 轮，防自嵌套死循环） */
     HlsPlaylist pl;
     memset(&pl, 0, sizeof(pl));
     int ok = 0;
-    for (int round = 0; round < 4 && !quitNow(); round++) {
-        if (!plBuf && !hlsHttpGet(plUrl, &plBuf, &plLen, 64 * 1024, &g_quit)) break;
+    for (int round = 0; round < 4 && !quitNow() && s->gen == g_netGen; round++) {
+        if (!plBuf && !hlsHttpGet(plUrl, &plBuf, &plLen, 64 * 1024, &g_quit, &s->killReq)) break;
         if (!hlsParsePlaylist((const char*)plBuf, plLen, plUrl, &pl)) break;
         LocalFree(plBuf); plBuf = NULL;
         if (!pl.isMaster) { ok = 1; break; }
@@ -989,12 +1032,13 @@ static unsigned __stdcall hlsThread(void* arg) {
         plUrl[sizeof(plUrl) - 1] = 0;
     }
     if (!ok) {
-        if (!quitNow()) {
+        if (!quitNow() && s->gen == g_netGen) {
             setStatusW(L"播放列表获取失败");
             InterlockedExchange(&g_netErr, 1);
         }
         if (plBuf) LocalFree(plBuf);
         if (take) prewarmFreeAll(take);
+        /* sess 由 worker 统一释放（见 netStreamThread 说明） */
         return 0;
     }
 
@@ -1004,10 +1048,10 @@ static unsigned __stdcall hlsThread(void* arg) {
 
     static BYTE esBuf[HLS_ES_CAP];
     for (;;) {
-        if (quitNow()) break;
+        if (quitNow() || s->gen != g_netGen) break;
         BYTE* pb = NULL; int pn = 0;
-        if (!hlsHttpGet(plUrl, &pb, &pn, 64 * 1024, &g_quit)) {
-            if (quitNow()) break;
+        if (!hlsHttpGet(plUrl, &pb, &pn, 64 * 1024, &g_quit, &s->killReq)) {
+            if (quitNow() || s->gen != g_netGen) break;
             quitSleep(1000); continue;   /* 列表刷新失败稍后重试 */
         }
         HlsPlaylist pl2;
@@ -1018,17 +1062,14 @@ static unsigned __stdcall hlsThread(void* arg) {
         }
         LocalFree(pb);
 
-        for (int i = 0; i < pl2.nSegs && !quitNow(); i++) {
+        for (int i = 0; i < pl2.nSegs && !quitNow() && s->gen == g_netGen; i++) {
             int seq = pl2.mediaSeq + i;
             if (seq < nextSeq) continue;
             nextSeq = seq + 1;
 
             BYTE* seg = NULL; int segLen = 0;
-            if (take && take->segBuf && _stricmp(take->segUrl, pl2.segUrl[i]) == 0) {
-                seg = take->segBuf; segLen = take->segLen;
-                take->segBuf = NULL;
-            } else if (!hlsHttpGet(pl2.segUrl[i], &seg, &segLen, HLS_SEG_MAX, &g_quit)) {
-                if (quitNow()) break;
+            if (!hlsHttpGet(pl2.segUrl[i], &seg, &segLen, HLS_SEG_MAX, &g_quit, &s->killReq)) {
+                if (quitNow() || s->gen != g_netGen) break;
                 nextSeq = seq;      /* 下一轮重试此分片 */
                 break;
             }
@@ -1044,17 +1085,17 @@ static unsigned __stdcall hlsThread(void* arg) {
             }
             if (ts.esType != 0x03 && ts.esType != 0x04 && ts.esType != 0x0F)
                 continue;
-            ringWrite(esBuf, esLen);
+            if (sessRingWrite(s, esBuf, esLen) < 0) goto out;
         }
 
-        if (take) { prewarmFreeAll(take); take = NULL; }
-        if (quitNow()) break;
+        if (quitNow() || s->gen != g_netGen) break;
         if (pl2.endList) { InterlockedExchange(&g_netDone, 1); break; }
         int waitMs = pl2.targetDur * 500; if (waitMs < 500) waitMs = 500;
         quitSleep(waitMs);
     }
 out:
     if (take) prewarmFreeAll(take);
+    /* sess 由 worker 统一释放（见 netStreamThread 说明） */
     return 0;
 }
 
@@ -1100,7 +1141,7 @@ static void prewarmHls(Prewarm* pw) {
     pw->isHls = 1;
     for (int round = 0; round < 4 && !pw->quit; round++) {
         BYTE* buf = NULL; int len = 0;
-        if (!hlsHttpGet(plUrl, &buf, &len, 64 * 1024, &pw->quit)) return;
+        if (!hlsHttpGet(plUrl, &buf, &len, 64 * 1024, &pw->quit, NULL)) return;
         HlsPlaylist pl;
         if (!hlsParsePlaylist((const char*)buf, len, plUrl, &pl)) {
             LocalFree(buf); return;
@@ -1118,7 +1159,7 @@ static void prewarmHls(Prewarm* pw) {
         if (pl.nSegs > 0 && !pw->quit) {
             const char* su = pl.segUrl[pl.nSegs - 1];
             BYTE* sb = NULL; int sl = 0;
-            if (hlsHttpGet(su, &sb, &sl, HLS_SEG_MAX, &pw->quit) && sl > 0) {
+            if (hlsHttpGet(su, &sb, &sl, HLS_SEG_MAX, &pw->quit, NULL) && sl > 0) {
                 _snprintf(pw->segUrl, sizeof(pw->segUrl) - 1, "%s", su);
                 pw->segUrl[sizeof(pw->segUrl) - 1] = 0;
                 pw->segBuf = sb; pw->segLen = sl;
@@ -1197,8 +1238,41 @@ void radio_prewarm(const char* utf8Url) {
     ResumeThread(h);
 }
 
+/* 新 worker 启动参数：携带预缓存接管对象与上一代 worker 线程句柄。
+ * 切台时由 UI 线程把旧 worker 句柄打包交给新 worker，新 worker 在自己的
+ * 线程里 join 旧 worker（不阻塞 UI），确认旧会话完全清理后再分配资源。 */
+typedef struct {
+    Prewarm* take;
+    HANDLE   oldThread;
+} StartArg;
+
 static unsigned __stdcall worker(void* arg) {
-    Prewarm* take = (Prewarm*)arg;
+    StartArg* sa = (StartArg*)arg;
+    Prewarm* take = sa ? sa->take : NULL;
+    HANDLE   oldThread = sa ? sa->oldThread : NULL;
+    if (sa) free(sa);
+
+    /* 先等待上一代 worker 完全退出（在本工作线程内等待，UI 不卡顿）。
+     * 旧 worker 收到 quit 后会强制中断网络并释放其全部全局资源；
+     * 必须等它退出，两代 worker 才能安全交接 g_rb/g_hWo/g_faad 等全局状态。 */
+    if (oldThread) {
+        InterlockedExchange(&g_quit, 1);
+        if (g_hWake)  SetEvent(g_hWake);
+        if (g_rbEvt)  SetEvent(g_rbEvt);
+        if (g_hWo)    waveOutReset(g_hWo);
+        /* 旧 worker 通常在 2~5 秒内自行退出（含强制中断网络） */
+        if (WaitForSingleObject(oldThread, 6000) == WAIT_TIMEOUT) {
+            /* 极少数情况下旧线程卡死：再给它时间，但不无限等。
+             * 无论如何继续（旧线程即便残留也因代际失效而不再触碰新资源）。 */
+            WaitForSingleObject(oldThread, 4000);
+        }
+        CloseHandle(oldThread);
+        /* 旧 worker 退出时会清 g_active/g_threadRun，这里重新确立新会话状态 */
+        InterlockedExchange(&g_active, 1);
+    }
+
+    /* 交接完成：清除上一代的退出标志，新会话开始正常运行 */
+    InterlockedExchange(&g_quit, 0);
     InterlockedExchange(&g_threadRun, 1);
 
     char urlA[1024] = {0};
@@ -1240,6 +1314,19 @@ static unsigned __stdcall worker(void* arg) {
     setState(RS_CONNECTING);
     setStatusW(L"正在连接…");
 
+    /* 本会话代际：递增后，任何上一代残留网络线程的写环操作立即失效，
+     * 它们绝不会碰到本会话新分配的 g_rb / g_rbEvt。 */
+    LONG myGen = InterlockedIncrement(&g_gen);
+    InterlockedExchange(&g_netGen, myGen);
+
+    /* 网络线程会话上下文（堆分配；网络线程退出后由 worker 在 done 段统一释放，
+     * 以避免 worker 强制中断时访问悬垂指针） */
+    NetSess* sess = (NetSess*)calloc(1, sizeof(NetSess));
+    if (!sess) { setStatusW(L"内存不足"); setState(RS_ERROR); prewarmFreeAll(take); take = NULL; goto done; }
+    sess->rb = g_rb; sess->rbEvt = g_rbEvt; sess->gen = myGen;
+    sess->hReq = NULL; sess->killReq = NULL;
+    g_killSess = sess;   /* 供 done 段强制中断 HLS/流式句柄 */
+
     /* ---- 分发：确定 HLS 还是流式，启动网络线程 ---- */
     int hls = 0;
     {
@@ -1247,7 +1334,7 @@ static unsigned __stdcall worker(void* arg) {
         if (isPlaylistExt(urlA, &isPls)) {
             if (isPls) {
                 setStatusW(L"暂不支持 PLS 格式"); setState(RS_ERROR);
-                prewarmFreeAll(take); take = NULL;
+                prewarmFreeAll(take); take = NULL; free(sess); g_killSess = NULL;
                 goto done;
             }
             hls = 1;
@@ -1256,37 +1343,45 @@ static unsigned __stdcall worker(void* arg) {
         }
     }
 
+    /* HLS 预缓存数据由 HLS 线程自行重新拉取（媒体列表短，代价小），释放 take */
+    if (hls && take) { prewarmFreeAll(take); take = NULL; }
+
     if (hls) {
         unsigned tid = 0;
-        g_netThread = (HANDLE)_beginthreadex(NULL, 0, hlsThread, take, 0, &tid);
-        if (!g_netThread) {
-            setStatusW(L"线程创建失败"); setState(RS_ERROR);
-            goto done;
-        }
-        take = NULL;   /* 所有权移交给 hlsThread */
+        HANDLE h = (HANDLE)_beginthreadex(NULL, 0, hlsThread, sess, 0, &tid);
+        if (!h) { setStatusW(L"线程创建失败"); setState(RS_ERROR); free(sess); g_killSess = NULL; goto done; }
+        g_netThread = h; sess = NULL;   /* 所有权移交网络线程 */
     } else {
-        /* ---- 流式：接管预缓存或新建连接，同步探测类型 ---- */
+        /* ---- 流式：接管预缓存或新建连接，同步探测类型（在工作线程，不卡 UI）---- */
         IcyCtx icy; memset(&icy, 0, sizeof(icy));
         char ct[128] = {0};
+        HINTERNET hInet = NULL, hConn = NULL, hReq = NULL;
         if (take) {
-            g_hInet = take->hInet; g_hConn = take->hConn; g_hReq = take->hReq;
+            hInet = take->hInet; hConn = take->hConn; hReq = take->hReq;
             take->hInet = take->hConn = take->hReq = NULL;
-            icy = take->icy;
-            icy.silent = 0;
+            icy = take->icy; icy.silent = 0;
             _snprintf(ct, sizeof(ct) - 1, "%s", take->ct);
             if (take->bufLen > 0) ringWrite(take->buf, take->bufLen);
             prewarmFreeAll(take); take = NULL;
         } else {
-            if (!httpOpen(urlA, &icy, ct, sizeof(ct))) {
+            if (!httpOpenEx(&hInet, &hConn, &hReq, urlA, &icy, ct, sizeof(ct), 8000, FALSE)) {
                 if (g_info.status[0] == 0) setStatusW(L"连接失败");
-                setState(RS_ERROR); goto done;
+                setState(RS_ERROR);
+                if (hReq) InternetCloseHandle(hReq);
+                if (hConn) InternetCloseHandle(hConn);
+                if (hInet) InternetCloseHandle(hInet);
+                free(sess); g_killSess = NULL;
+                goto done;
             }
             /* 预读首块，识别伪装成流的播放列表 */
             BYTE head[1024];
-            int got = icyRead(&icy, head, sizeof(head));
+            int got = icyReadEx(hReq, &icy, &g_quit, head, sizeof(head));
             if (got <= 0) {
                 setStatusW(got == 0 ? L"流已关闭" : L"网络读取失败");
-                setState(RS_ERROR); goto done;
+                setState(RS_ERROR);
+                InternetCloseHandle(hReq); InternetCloseHandle(hConn); InternetCloseHandle(hInet);
+                free(sess); g_killSess = NULL;
+                goto done;
             }
             if (got >= 7 && memcmp(head, "#EXTM3U", 7) == 0)
                 _snprintf(ct, sizeof(ct) - 1, "%s", "application/vnd.apple.mpegurl");
@@ -1295,15 +1390,28 @@ static unsigned __stdcall worker(void* arg) {
 
         unsigned tid = 0;
         if (isPlaylistCt(ct)) {
-            httpClose();
-            g_netThread = (HANDLE)_beginthreadex(NULL, 0, hlsThread, NULL, 0, &tid);
+            /* 伪装成流的 HLS：关掉流式连接，交给 HLS 线程重新拉取 */
+            if (hReq) InternetCloseHandle(hReq);
+            if (hConn) InternetCloseHandle(hConn);
+            if (hInet) InternetCloseHandle(hInet);
+            HANDLE h = (HANDLE)_beginthreadex(NULL, 0, hlsThread, sess, 0, &tid);
+            if (!h) { setStatusW(L"线程创建失败"); setState(RS_ERROR); free(sess); g_killSess = NULL; goto done; }
+            g_netThread = h; sess = NULL;
         } else {
-            g_netIcy = icy;
-            g_netThread = (HANDLE)_beginthreadex(NULL, 0, netStreamThread, NULL, 0, &tid);
-        }
-        if (!g_netThread) {
-            setStatusW(L"线程创建失败"); setState(RS_ERROR);
-            goto done;
+            /* 把已建连的整套句柄移交给网络线程（它负责关闭与重连）。
+             * 注意 WinINet 中关闭父句柄 hInet/hConn 会连带关闭 hReq，
+             * 故三者必须一起交给网络线程，不能在这里提前关闭。 */
+            sess->hInet = hInet; sess->hConn = hConn; sess->hReq = hReq;
+            HANDLE h = (HANDLE)_beginthreadex(NULL, 0, netStreamThread, sess, 0, &tid);
+            if (!h) {
+                setStatusW(L"线程创建失败"); setState(RS_ERROR);
+                if (hReq) InternetCloseHandle(hReq);
+                if (hConn) InternetCloseHandle(hConn);
+                if (hInet) InternetCloseHandle(hInet);
+                free(sess); g_killSess = NULL;
+                goto done;
+            }
+            g_netThread = h; sess = NULL;
         }
     }
 
@@ -1313,20 +1421,44 @@ done:
     {
         int wasQuit = quitNow();
         InterlockedExchange(&g_quit, 1);   /* 通知网络线程退出 */
+        /* 递增代际：让仍在运行的旧网络线程立即停止写环并自行退出，
+         * 这样它绝不会再触碰下面即将释放的 g_rb / g_rbEvt。 */
+        InterlockedIncrement(&g_gen);
+        InterlockedIncrement(&g_netGen);
         if (g_rbEvt) SetEvent(g_rbEvt);
         if (g_hWake) SetEvent(g_hWake);
         if (g_netThread) {
-            if (WaitForSingleObject(g_netThread, 5000) == WAIT_TIMEOUT) {
-                httpClose();   /* 强制解除阻塞中的网络读取 */
+            /* 先等优雅退出；超时则强制关闭正在阻塞的 WinINet 句柄解除阻塞。
+             * 网络线程通过 NetSess 持有句柄，关闭后其 InternetReadFile/
+             * HttpSendRequest 会立刻失败返回，线程随之退出。 */
+            if (WaitForSingleObject(g_netThread, 2000) == WAIT_TIMEOUT) {
+                NetSess* ks = g_killSess;
+                if (ks) {
+                    if (ks->killReq) { InternetCloseHandle((HINTERNET)ks->killReq); ks->killReq = NULL; }
+                    if (ks->hReq)    { InternetCloseHandle(ks->hReq); ks->hReq = NULL; }
+                    if (ks->hConn)   { InternetCloseHandle(ks->hConn); ks->hConn = NULL; }
+                    if (ks->hInet)   { InternetCloseHandle(ks->hInet); ks->hInet = NULL; }
+                }
+                /* 兜底：清理任何残留在全局变量里的句柄 */
+                if (g_hReq)  { InternetCloseHandle(g_hReq);  g_hReq  = NULL; }
+                if (g_hConn) { InternetCloseHandle(g_hConn); g_hConn = NULL; }
+                if (g_hInet) { InternetCloseHandle(g_hInet); g_hInet = NULL; }
                 WaitForSingleObject(g_netThread, 3000);
             }
             CloseHandle(g_netThread); g_netThread = NULL;
         }
-        httpClose();
+        /* 网络线程已 join：sess 此刻无人使用，安全释放（句柄已被网络线程
+         * 自行关闭或在上面的强制中断中关闭）。 */
+        if (g_killSess) { free(g_killSess); g_killSess = NULL; }
+        /* 全局句柄兜底清理（正常路径网络线程已自行关闭） */
+        if (g_hReq)  { InternetCloseHandle(g_hReq);  g_hReq  = NULL; }
+        if (g_hConn) { InternetCloseHandle(g_hConn); g_hConn = NULL; }
+        if (g_hInet) { InternetCloseHandle(g_hInet); g_hInet = NULL; }
         woClose();
         if (take) prewarmFreeAll(take);
         if (g_faad) { NeAACDecClose(g_faad); g_faad = NULL; g_faadInited = FALSE; }
         if (g_hWoEvt) { CloseHandle(g_hWoEvt); g_hWoEvt = NULL; }
+        /* 网络线程已确认退出（上面 join 过），此时释放环形缓冲安全，无 use-after-free */
         if (g_rbEvt) { CloseHandle(g_rbEvt); g_rbEvt = NULL; }
         if (g_rb) { VirtualFree(g_rb, 0, MEM_RELEASE); g_rb = NULL; }
         if (wasQuit) {
@@ -1379,22 +1511,26 @@ BOOL radio_play(const char* utf8Url, const WCHAR* display) {
         g_pw = NULL;
     }
 
+    /* 切台：不在 UI 线程等待旧 worker（连接不畅时旧 worker 可能要几秒才能
+     * 强制中断网络并退出，长等会让界面卡死）。改为把旧 worker 句柄打包交给
+     * 新 worker，由新 worker 在自己的后台线程里 join 旧 worker 后再开播。
+     * UI 线程立即返回，界面不再卡顿。 */
+    HANDLE oldThread = NULL;
     if (g_thread) {
-        /* 必须等旧线程真正退出再启新线程：否则两个 worker 共享
-         * g_hWo/g_faad 等全局，旧线程的清理会毁掉新台的播放（无声/崩溃） */
         InterlockedExchange(&g_quit, 1);
-        if (g_hWake) SetEvent(g_hWake);
-        if (g_rbEvt) SetEvent(g_rbEvt);   /* 唤醒阻塞在环形缓冲上的解码线程 */
-        DWORD waited = 0;
-        /* 新 worker 内部还要等网络线程退出（最长约 8 秒），上限放宽到 20 秒 */
-        while (WaitForSingleObject(g_thread, 100) == WAIT_TIMEOUT && waited < 20000)
-            waited += 100;
-        CloseHandle(g_thread); g_thread = NULL;
+        if (g_hWake)  SetEvent(g_hWake);
+        if (g_rbEvt)  SetEvent(g_rbEvt);
+        if (g_hWo)    waveOutReset(g_hWo);
+        oldThread = g_thread;   /* 所有权移交新 worker 去 CloseHandle */
+        g_thread = NULL;
     }
 
     WCHAR urlW[512] = {0};
     if (MultiByteToWideChar(CP_UTF8, 0, utf8Url, -1, urlW, 511) <= 0) {
-        if (MultiByteToWideChar(CP_ACP, 0, utf8Url, -1, urlW, 511) <= 0) return FALSE;
+        if (MultiByteToWideChar(CP_ACP, 0, utf8Url, -1, urlW, 511) <= 0) {
+            if (oldThread) CloseHandle(oldThread);
+            return FALSE;
+        }
     }
 
     resetInfo(urlW);
@@ -1402,13 +1538,25 @@ BOOL radio_play(const char* utf8Url, const WCHAR* display) {
     InterlockedExchange(&g_pause, 0);
     InterlockedExchange(&g_active, 1);
 
-    unsigned tid = 0;
-    g_thread = (HANDLE)_beginthreadex(NULL, 0, worker, take, 0, &tid);
-    if (!g_thread) {
-        if (take && take->thread) { CloseHandle(take->thread); take->thread = NULL; }
+    StartArg* sa = (StartArg*)calloc(1, sizeof(StartArg));
+    if (!sa) {
+        if (oldThread) CloseHandle(oldThread);
         prewarmFreeAll(take);
         return FALSE;
     }
+    sa->take = take;
+    sa->oldThread = oldThread;
+
+    unsigned tid = 0;
+    HANDLE h = (HANDLE)_beginthreadex(NULL, 0, worker, sa, 0, &tid);
+    if (!h) {
+        if (take && take->thread) { CloseHandle(take->thread); take->thread = NULL; }
+        prewarmFreeAll(take);
+        if (oldThread) CloseHandle(oldThread);
+        free(sa);
+        return FALSE;
+    }
+    g_thread = h;
     return TRUE;
 }
 
