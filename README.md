@@ -33,13 +33,23 @@ No installer, no runtime dependencies, no extra DLLs. Download one file, double-
 
 ### 从源码构建
 
-需要 MinGW-w64 GCC（Windows），然后执行：
+需要 MinGW-w64 GCC（Windows）。推荐使用 Make 构建——**如果系统没有 GCC，构建脚本会自动检测并尝试通过 WinGet 或从 GitHub 下载便携版 MinGW-w64**（无需手动安装）：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
+```sh
+make            # 首次会自动检测/下载工具链，然后编译 faad 静态库并链接 NetRadio.exe
+make setup      # 仅重新检测/安装工具链
+make check      # 查看当前使用的编译器
+make clean      # 清除构建产物
 ```
 
-脚本会先编译内置的 FAAD2 源码为静态库，再链接生成 `NetRadio.exe`。
+> 在 Windows 上推荐使用 MinGW-w64 自带的 `mingw32-make`（或 MSYS2 / Git-Bash 的 `make`）。
+> 若没有 make，也可以继续使用旧脚本：
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File build.ps1
+> ```
+
+Makefile 会先编译内置的 FAAD2 源码为静态库（支持增量编译与头文件依赖追踪），再链接生成 `NetRadio.exe`。
 
 ### 技术实现
 
@@ -70,13 +80,23 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ### Building from source
 
-Requires MinGW-w64 GCC on Windows, then run:
+Requires MinGW-w64 GCC on Windows. The recommended way is the Makefile — **if no GCC is found, the build script auto-detects one and can install it via WinGet or download a portable MinGW-w64 from GitHub** automatically:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
+```sh
+make            # first run auto-detects/downloads the toolchain, then builds
+make setup      # (re-)detect / install the toolchain only
+make check      # show the compiler in use
+make clean      # remove build artifacts
 ```
 
-The script compiles the bundled FAAD2 sources into a static library and links `NetRadio.exe`.
+> On Windows, prefer `mingw32-make` shipped with MinGW-w64 (or `make` from MSYS2 / Git-Bash).
+> Without make, the legacy script still works:
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File build.ps1
+> ```
+
+The Makefile compiles the bundled FAAD2 sources into a static library (incremental builds with header dependency tracking) and links `NetRadio.exe`.
 
 ### How it works
 

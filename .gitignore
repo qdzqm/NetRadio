@@ -3,3 +3,13 @@ faad/obj/
 faad/libfaad.a
 *.o
 *.log
+
+# 自动生成的工具链配置 / generated toolchain config
+config.mk
+
+# 自动下载的便携工具链 / auto-downloaded portable toolchain
+toolchain/
+
+# 崩溃转储 / crash dumps
+*.stackdump
+
